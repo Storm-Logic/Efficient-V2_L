@@ -1,3 +1,8 @@
 venv/
 results/
 imagenet/
+val/
+venv/
+oxford-iiit-pet/
+efficientnetv2l_hf_imagenet1k_finetuned.pth
+__pycache__

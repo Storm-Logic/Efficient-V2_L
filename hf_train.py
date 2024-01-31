@@ -1,11 +1,20 @@
 import argparse
+import json
+import os
 from pathlib import Path
+from urllib.request import urlretrieve
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
+from torchvision.datasets import ImageFolder
 from torchvision.models import EfficientNet_V2_L_Weights, efficientnet_v2_l
 from tqdm import tqdm
+
+
+IMAGENET_CLASS_INDEX_URL = (
+    "https://s3.amazonaws.com/deep-learning-models/image-models/imagenet_class_index.json"
+)
 
 
 class HuggingFaceImageDataset(Dataset):
@@ -37,7 +46,7 @@ def pick_device():
     return "cpu"
 
 
-def load_hf_dataset(args):
+def load_hf_dataset(args, split, shuffle=False, max_samples=None):
     try:
         from datasets import load_dataset
     except ImportError as exc:
@@ -49,16 +58,55 @@ def load_hf_dataset(args):
     dataset = load_dataset(
         args.dataset_name,
         args.dataset_config,
-        split=args.split,
+        split=split,
         token=args.token,
         trust_remote_code=args.trust_remote_code,
     )
 
-    if args.shuffle:
+    if shuffle:
         dataset = dataset.shuffle(seed=args.seed)
-    if args.max_samples is not None:
-        dataset = dataset.select(range(min(args.max_samples, len(dataset))))
+    if max_samples is not None:
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
 
+    return dataset
+
+
+def load_wnid_to_imagenet_index(class_index_path):
+    class_index_path = Path(class_index_path)
+    if not class_index_path.exists():
+        print(f"Downloading ImageNet class index: {class_index_path}")
+        urlretrieve(IMAGENET_CLASS_INDEX_URL, class_index_path)
+
+    with class_index_path.open("r", encoding="utf-8") as file:
+        class_index = json.load(file)
+
+    return {
+        wnid: int(index)
+        for index, (wnid, _class_name) in class_index.items()
+    }
+
+
+def load_custom_imagefolder(args, transform):
+    dataset = ImageFolder(args.custom_train_dir, transform=transform)
+    wnid_to_imagenet_index = load_wnid_to_imagenet_index(args.imagenet_class_index)
+    missing = sorted(set(dataset.classes) - set(wnid_to_imagenet_index))
+    if missing:
+        raise ValueError(
+            "Missing ImageNet label mapping for local folders: "
+            + ", ".join(missing)
+            + f"\nCheck that {args.imagenet_class_index} is a valid ImageNet class-index JSON."
+        )
+
+    local_idx_to_imagenet_idx = {
+        local_idx: wnid_to_imagenet_index[wnid]
+        for wnid, local_idx in dataset.class_to_idx.items()
+    }
+    dataset.samples = [
+        (path, local_idx_to_imagenet_idx[label])
+        for path, label in dataset.samples
+    ]
+    dataset.imgs = dataset.samples
+    dataset.targets = [label for _, label in dataset.samples]
     return dataset
 
 
@@ -94,23 +142,37 @@ def train(args):
     weights = EfficientNet_V2_L_Weights.IMAGENET1K_V1
     transform = weights.transforms()
 
-    hf_dataset = load_hf_dataset(args)
-    dataset = HuggingFaceImageDataset(hf_dataset, transform)
-    print("Total images:", len(dataset))
-
-    val_size = max(1, int(args.val_fraction * len(dataset)))
-    train_size = len(dataset) - val_size
-    if train_size < 1:
-        raise ValueError("Dataset is too small after applying --max-samples")
-
-    train_data, val_data = random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(args.seed),
+    train_hf_dataset = load_hf_dataset(
+        args,
+        split=args.train_split,
+        shuffle=args.shuffle,
+        max_samples=args.max_samples,
     )
+    val_hf_dataset = load_hf_dataset(
+        args,
+        split=args.validation_split,
+        shuffle=False,
+        max_samples=args.max_validation_samples,
+    )
+    train_data = HuggingFaceImageDataset(train_hf_dataset, transform)
+    train_parts = [train_data]
+
+    custom_train_data = None
+    if args.use_custom_train_data:
+        custom_train_data = load_custom_imagefolder(args, transform)
+        train_parts.append(custom_train_data)
+
+    combined_train_data = ConcatDataset(train_parts)
+
+    val_data = HuggingFaceImageDataset(val_hf_dataset, transform)
+    print("Hugging Face training images:", len(train_data))
+    if custom_train_data is not None:
+        print("Custom training images:", len(custom_train_data))
+    print("Total training images:", len(combined_train_data))
+    print("Validation images:", len(val_data))
 
     train_loader = DataLoader(
-        train_data,
+        combined_train_data,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
@@ -124,7 +186,7 @@ def train(args):
         pin_memory=device == "cuda",
     )
 
-    model = efficientnet_v2_l(weights=weights)
+    model = efficientnet_v2_l(weights=None)
     if args.freeze_backbone:
         for param in model.features.parameters():
             param.requires_grad = False
@@ -177,22 +239,26 @@ def parse_args():
     )
     parser.add_argument("--dataset-name", default="ILSVRC/imagenet-1k")
     parser.add_argument("--dataset-config", default=None)
-    parser.add_argument("--split", default="train")
-    parser.add_argument("--max-samples", type=int, default=1000)
-    parser.add_argument("--val-fraction", type=float, default=0.2)
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--train-split", default="train")
+    parser.add_argument("--validation-split", default="validation")
+    parser.add_argument("--max-samples", type=int, default=200)
+    parser.add_argument("--max-validation-samples", type=int, default=100)
+    parser.add_argument("--custom-train-dir", default="val")
+    parser.add_argument("--imagenet-class-index", default="imagenet_class_index.json")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--eval-batch-size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", default="efficientnetv2l_hf_imagenet1k_finetuned.pth")
-    parser.add_argument("--token", default=None, help="Hugging Face token for gated datasets.")
+    parser.add_argument("--token", default=os.environ.get("HF_TOKEN"), help="Hugging Face token for gated datasets.")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--no-custom-train-data", dest="use_custom_train_data", action="store_false")
     parser.add_argument("--no-shuffle", dest="shuffle", action="store_false")
     parser.add_argument("--train-full-model", dest="freeze_backbone", action="store_false")
-    parser.set_defaults(shuffle=True, freeze_backbone=True)
+    parser.set_defaults(shuffle=True, freeze_backbone=True, use_custom_train_data=True)
     return parser.parse_args()
 
 
